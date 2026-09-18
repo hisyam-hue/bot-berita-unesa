@@ -2,20 +2,9 @@ import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 import re
+import xml.etree.ElementTree as ET
 
 CSV_FILE = "rekap_berita_unesa.csv"
-
-# Daftar URL sumber berita Unesa (Halaman Utama + Kategori-kategori Utama)
-SOURCES = [
-    "https://www.unesa.ac.id/page/berita",
-    "https://www.unesa.ac.id/category/berita-umum",
-    "https://www.unesa.ac.id/category/unesacategory",
-    "https://www.unesa.ac.id/category/prestasi-institusi",
-    "https://www.unesa.ac.id/category/kemahasiswaan",
-    "https://www.unesa.ac.id/category/pengabdian-masyarakat",
-    "https://www.unesa.ac.id/category/kerjasama",
-    "https://www.unesa.ac.id/category/inovasi-penelitian"
-]
 
 MONTH_MAP = {
     'Januari': 1, 'Jan': 1, 'Februari': 2, 'Feb': 2, 'Maret': 3, 'Mar': 3,
@@ -48,81 +37,95 @@ def scrape_unesa():
     all_articles = []
     seen_links = set()
 
-    for base_url in SOURCES:
-        # Coba tarik hingga 5 sub-halaman per kategori
-        for p in range(1, 6):
-            url = f"{base_url}/{p}" if p > 1 else base_url
-            print(f"Scraping: {url}")
+    # Target URL: RSS Feed & Arsip Tanggal September 2026
+    target_urls = [
+        "https://www.unesa.ac.id/feed",
+        "https://www.unesa.ac.id/page/berita/feed",
+        "https://www.unesa.ac.id/2026/09/",
+        "https://www.unesa.ac.id/page/berita"
+    ]
 
-            try:
-                res = requests.get(url, headers=headers, timeout=12)
-                if res.status_code != 200:
-                    break
+    for url in target_urls:
+        print(f"Mencoba ekstraksi dari: {url}")
+        try:
+            res = requests.get(url, headers=headers, timeout=15)
+            if res.status_code != 200:
+                continue
 
-                soup = BeautifulSoup(res.text, 'html.parser')
-                a_tags = soup.find_all('a', href=re.compile(r'/read/'))
+            # Jika respon berbentuk XML / RSS Feed
+            if 'xml' in res.headers.get('Content-Type', '') or url.endswith('/feed'):
+                try:
+                    root = ET.fromstring(res.content)
+                    for item in root.findall('.//item'):
+                        title = clean_text(item.find('title').text if item.find('title') is not None else "")
+                        link = clean_text(item.find('link').text if item.find('link') is not None else "")
+                        pub_date = item.find('pubDate').text if item.find('pubDate') is not None else ""
+                        
+                        if link and link not in seen_links and len(title) > 10:
+                            day, month, year, formatted_date = parse_date(pub_date)
+                            all_articles.append({
+                                'tanggal': formatted_date,
+                                'judul': title,
+                                'kategori': "Berita Utama",
+                                'link': link,
+                                'bulan': month or 9,
+                                'tahun': year or 2026
+                            })
+                            seen_links.add(link)
+                except Exception as e_xml:
+                    print(f"Parsing RSS XML gagal, lanjut metode HTML parsing: {e_xml}")
 
-                if not a_tags:
-                    break
+            # Metode HTML Parsing
+            soup = BeautifulSoup(res.text, 'html.parser')
+            a_tags = soup.find_all('a', href=re.compile(r'/read/'))
 
-                count_added = 0
-                for a in a_tags:
-                    link = a.get('href', '')
-                    if not link.startswith('http'):
-                        link = 'https://www.unesa.ac.id' + link
+            for a in a_tags:
+                link = a.get('href', '')
+                if not link.startswith('http'):
+                    link = 'https://www.unesa.ac.id' + link
 
-                    if link in seen_links:
-                        continue
+                if link in seen_links:
+                    continue
 
-                    # Judul
-                    judul = clean_text(a.get_text())
-                    parent = a.find_parent(['div', 'article', 'li'])
-                    if len(judul) < 15 or "Read More" in judul:
-                        if parent:
-                            h_tag = parent.find(['h1', 'h2', 'h3', 'h4', 'h5'])
-                            if h_tag:
-                                judul = clean_text(h_tag.get_text())
-
-                    if not judul or len(judul) < 10 or "Read More" in judul:
-                        continue
-
-                    # Tanggal & Kategori
-                    date_text = ""
-                    kategori = "Berita Umum"
+                judul = clean_text(a.get_text())
+                parent = a.find_parent(['div', 'article', 'li'])
+                
+                if len(judul) < 15 or "Read More" in judul:
                     if parent:
-                        text_all = parent.get_text()
-                        dm = re.search(r'\d{1,2}\s+[A-Za-z]+\s+\d{4}', text_all)
-                        if dm:
-                            date_text = dm.group(0)
+                        h_tag = parent.find(['h1', 'h2', 'h3', 'h4', 'h5'])
+                        if h_tag:
+                            judul = clean_text(h_tag.get_text())
 
-                        cat_elem = parent.find(class_=re.compile(r'cat|kategori|badge|tag', re.I))
-                        if cat_elem:
-                            kategori = clean_text(cat_elem.get_text())
+                if not judul or len(judul) < 10 or "Read More" in judul:
+                    continue
 
-                    day, month, year, formatted_date = parse_date(date_text)
+                date_text = ""
+                kategori = "Berita Umum"
+                if parent:
+                    text_all = parent.get_text()
+                    dm = re.search(r'\d{1,2}\s+[A-Za-z]+\s+\d{4}', text_all)
+                    if dm:
+                        date_text = dm.group(0)
 
-                    all_articles.append({
-                        'tanggal': formatted_date,
-                        'judul': judul,
-                        'kategori': kategori,
-                        'link': link,
-                        'bulan': month,
-                        'tahun': year
-                    })
-                    seen_links.add(link)
-                    count_added += 1
+                day, month, year, formatted_date = parse_date(date_text)
 
-                if count_added == 0 and p > 1:
-                    break
+                all_articles.append({
+                    'tanggal': formatted_date,
+                    'judul': judul,
+                    'kategori': kategori,
+                    'link': link,
+                    'bulan': month,
+                    'tahun': year
+                })
+                seen_links.add(link)
 
-            except Exception as e:
-                print(f"Error {url}: {e}")
-                break
+        except Exception as e:
+            print(f"Error pada {url}: {e}")
 
     if all_articles:
         final_df = pd.DataFrame(all_articles)
         final_df.to_csv(CSV_FILE, index=False)
-        print(f"Selesai! Berhasil merekap {len(final_df)} berita dari seluruh kategori Unesa.")
+        print(f"Selesai! Berhasil merekap {len(final_df)} berita.")
     else:
         print("Gagal mengambil data.")
 
