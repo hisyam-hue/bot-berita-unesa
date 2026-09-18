@@ -2,10 +2,11 @@ import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 import re
+import os
 
 BASE_URL = "https://www.unesa.ac.id/page/berita"
 CSV_FILE = "rekap_berita_unesa.csv"
-MAX_PAGES = 25  # Menyapu penuh 25 halaman berita
+MAX_PAGES = 25
 
 MONTH_MAP = {
     'Januari': 1, 'Jan': 1, 'Februari': 2, 'Feb': 2, 'Maret': 3, 'Mar': 3,
@@ -32,7 +33,7 @@ def parse_date(date_str):
 
 def scrape_unesa():
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36"
     }
 
     all_articles = []
@@ -45,39 +46,51 @@ def scrape_unesa():
         try:
             res = requests.get(url, headers=headers, timeout=15)
             if res.status_code != 200:
-                print(f"Gagal memuat halaman {page}")
+                print(f"Gagal akses halaman {page}")
                 break
 
             soup = BeautifulSoup(res.text, 'html.parser')
             
-            # Cari elemen artikel berita
-            articles = soup.find_all(['div', 'article'], class_=re.compile(r'post|news|berita|card|item|col', re.I))
+            # Cari seluruh elemen tautan yang menuju artikel berita /read/
+            all_a_tags = soup.find_all('a', href=re.compile(r'/read/'))
 
-            for art in articles:
-                a_tag = art.find('a', href=re.compile(r'/read/'))
-                if not a_tag:
-                    continue
-
-                link = a_tag.get('href', '')
+            count_page = 0
+            for a in all_a_tags:
+                link = a.get('href', '')
                 if not link.startswith('http'):
                     link = 'https://www.unesa.ac.id' + link
 
                 if link in seen_links:
                     continue
 
-                h_tag = art.find(['h1', 'h2', 'h3', 'h4', 'h5'])
-                judul = clean_text(h_tag.get_text()) if h_tag else clean_text(a_tag.get_text())
+                # Ambil judul artikel dari tag <a> atau parent terdekat
+                judul = clean_text(a.get_text())
+                if len(judul) < 15 or "Read More" in judul or "Selengkapnya" in judul:
+                    parent = a.find_parent(['div', 'article', 'li', 'td'])
+                    if parent:
+                        h_tag = parent.find(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
+                        if h_tag:
+                            judul = clean_text(h_tag.get_text())
 
                 if not judul or len(judul) < 10 or "Read More" in judul:
                     continue
 
+                # Cari informasi tanggal & kategori dari blok kontainer terdekat
+                parent = a.find_parent(['div', 'article', 'li'])
                 date_text = ""
-                date_elem = art.find(text=re.compile(r'\d{4}'))
-                if date_elem:
-                    date_text = str(date_elem).strip()
+                kategori = "Berita Umum"
 
-                cat_elem = art.find(class_=re.compile(r'cat|kategori|badge|label|tag', re.I))
-                kategori = clean_text(cat_elem.get_text()) if cat_elem else "Berita Umum"
+                if parent:
+                    # Ambil teks tanggal
+                    text_content = parent.get_text()
+                    date_match = re.search(r'\d{1,2}\s+[A-Za-z]+\s+\d{4}', text_content)
+                    if date_match:
+                        date_text = date_match.group(0)
+
+                    # Ambil kategori jika ada
+                    cat_elem = parent.find(class_=re.compile(r'cat|kategori|badge|label|tag', re.I))
+                    if cat_elem:
+                        kategori = clean_text(cat_elem.get_text())
 
                 day, month, year, formatted_date = parse_date(date_text)
 
@@ -90,15 +103,21 @@ def scrape_unesa():
                     'tahun': year
                 })
                 seen_links.add(link)
+                count_page += 1
+
+            print(f"Halaman {page}: didapat {count_page} berita baru.")
+            if count_page == 0 and page > 1:
+                print("Tidak ada berita tambahan, menghentikan ekstraksi.")
+                break
 
         except Exception as e:
-            print(f"Error halaman {page}: {e}")
+            print(f"Error pada halaman {page}: {e}")
             break
 
     if all_articles:
         final_df = pd.DataFrame(all_articles)
         final_df.to_csv(CSV_FILE, index=False)
-        print(f"Berhasil! Rekap total {len(final_df)} berita disimpan ke {CSV_FILE}.")
+        print(f"Selesai! Berhasil menyimpan total {len(final_df)} artikel ke {CSV_FILE}.")
     else:
         print("Tidak ada artikel yang diambil.")
 
