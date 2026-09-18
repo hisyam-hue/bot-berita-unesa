@@ -1,9 +1,10 @@
-import requests
-from bs4 import BeautifulSoup
 import pandas as pd
 import re
+import time
+from playwright.sync_api import sync_playwright
 
 CSV_FILE = "rekap_berita_unesa.csv"
+MAX_PAGES = 5  # Mengambil 5 halaman (sekitar 50 berita September)
 
 MONTH_MAP = {
     'Januari': 1, 'Jan': 1, 'Februari': 2, 'Feb': 2, 'Maret': 3, 'Mar': 3,
@@ -28,120 +29,88 @@ def parse_date(date_str):
         return day, month, year, f"{day} {month_name} {year}"
     return None, None, None, date_str
 
-def scrape_unesa():
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "X-Requested-With": "XMLHttpRequest"
-    }
-
+def run_scraper():
     all_articles = []
     seen_links = set()
 
-    # 1. Coba Tarik via API JSON Internal Unesa
-    api_success = False
-    for page in range(1, 15):
-        api_url = f"https://www.unesa.ac.id/api/berita?page={page}"
-        try:
-            res = requests.get(api_url, headers=headers, timeout=10)
-            if res.status_code == 200 and 'json' in res.headers.get('Content-Type', ''):
-                data = res.json()
-                items = data.get('data', []) or data.get('posts', []) or data
-                if isinstance(items, list) and len(items) > 0:
-                    api_success = True
-                    for item in items:
-                        judul = clean_text(item.get('title', '') or item.get('judul', ''))
-                        link = item.get('url', '') or item.get('link', '')
-                        date_str = item.get('created_at', '') or item.get('tanggal', '')
-                        kategori = item.get('category', '') or "Berita Utama"
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        print("Membuka halaman berita Unesa...")
+        page.goto("https://www.unesa.ac.id/page/berita", timeout=60000)
 
-                        if link and link not in seen_links and len(judul) > 5:
-                            day, month, year, formatted_date = parse_date(date_str)
-                            all_articles.append({
-                                'tanggal': formatted_date,
-                                'judul': judul,
-                                'kategori': kategori,
-                                'link': link,
-                                'bulan': month,
-                                'tahun': year
-                            })
-                            seen_links.add(link)
-        except Exception:
-            pass
+        for p_num in range(1, MAX_PAGES + 1):
+            print(f"Mengambil data halaman {p_num}...")
+            time.sleep(3)  # Tunggu AJAX render
 
-    # 2. Jika API internal dikunci, lakukan scraping dari berbagai jalur direktori kanal Unesa
-    if not api_success or len(all_articles) < 20:
-        base_channels = [
-            "https://www.unesa.ac.id/page/berita",
-            "https://www.unesa.ac.id/page/berita/1",
-            "https://www.unesa.ac.id/page/berita/2",
-            "https://www.unesa.ac.id/page/berita/3",
-            "https://www.unesa.ac.id/page/berita/4",
-            "https://www.unesa.ac.id/category/berita-utama",
-            "https://www.unesa.ac.id/category/unesacategory"
-        ]
+            # Ambil HTML konten
+            html = page.content()
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            a_tags = soup.find_all('a', href=re.compile(r'/read/'))
+            count = 0
+            for a in a_tags:
+                link = a.get('href', '')
+                if not link.startswith('http'):
+                    link = 'https://www.unesa.ac.id' + link
 
-        for target_url in base_channels:
-            try:
-                res = requests.get(target_url, headers=headers, timeout=12)
-                if res.status_code != 200:
+                if link in seen_links:
                     continue
 
-                soup = BeautifulSoup(res.text, 'html.parser')
-                a_tags = soup.find_all('a', href=re.compile(r'/read/'))
+                judul = clean_text(a.get_text())
+                parent = a.find_parent(['div', 'article', 'li'])
 
-                for a in a_tags:
-                    link = a.get('href', '')
-                    if not link.startswith('http'):
-                        link = 'https://www.unesa.ac.id' + link
-
-                    if link in seen_links:
-                        continue
-
-                    judul = clean_text(a.get_text())
-                    parent = a.find_parent(['div', 'article', 'li'])
-
-                    if len(judul) < 15 or "Read More" in judul:
-                        if parent:
-                            h_tag = parent.find(['h1', 'h2', 'h3', 'h4', 'h5'])
-                            if h_tag:
-                                judul = clean_text(h_tag.get_text())
-
-                    if not judul or len(judul) < 10 or "Read More" in judul:
-                        continue
-
-                    date_text = ""
-                    kategori = "Berita Umum"
+                if len(judul) < 15 or "Read More" in judul:
                     if parent:
-                        text_all = parent.get_text()
-                        dm = re.search(r'\d{1,2}\s+[A-Za-z]+\s+\d{4}', text_all)
-                        if dm:
-                            date_text = dm.group(0)
+                        h_tag = parent.find(['h1', 'h2', 'h3', 'h4', 'h5'])
+                        if h_tag:
+                            judul = clean_text(h_tag.get_text())
 
-                        cat_elem = parent.find(class_=re.compile(r'cat|kategori|badge|tag', re.I))
-                        if cat_elem:
-                            kategori = clean_text(cat_elem.get_text())
+                if not judul or len(judul) < 10 or "Read More" in judul:
+                    continue
 
-                    day, month, year, formatted_date = parse_date(date_text)
+                date_text = ""
+                kategori = "Berita Umum"
+                if parent:
+                    text_all = parent.get_text()
+                    dm = re.search(r'\d{1,2}\s+[A-Za-z]+\s+\d{4}', text_all)
+                    if dm:
+                        date_text = dm.group(0)
 
-                    all_articles.append({
-                        'tanggal': formatted_date,
-                        'judul': judul,
-                        'kategori': kategori,
-                        'link': link,
-                        'bulan': month,
-                        'tahun': year
-                    })
-                    seen_links.add(link)
+                day, month, year, formatted_date = parse_date(date_text)
 
-            except Exception as e:
-                print(f"Error pada {target_url}: {e}")
+                all_articles.append({
+                    'tanggal': formatted_date,
+                    'judul': judul,
+                    'kategori': kategori,
+                    'link': link,
+                    'bulan': month,
+                    'tahun': year
+                })
+                seen_links.add(link)
+                count += 1
+
+            print(f"Halaman {p_num}: didapat {count} berita.")
+
+            # Klik tombol Next/Halaman berikutnya
+            if p_num < MAX_PAGES:
+                try:
+                    next_button = page.locator(f"a:has-text('{p_num + 1}')").first
+                    if next_button.is_visible():
+                        next_button.click()
+                    else:
+                        break
+                except Exception as e:
+                    print(f"Gagal pindah ke halaman {p_num + 1}: {e}")
+                    break
+
+        browser.close()
 
     if all_articles:
-        final_df = pd.DataFrame(all_articles)
-        final_df.to_csv(CSV_FILE, index=False)
-        print(f"Berhasil merekap total {len(final_df)} artikel ke {CSV_FILE}.")
-    else:
-        print("Gagal mengambil data.")
+        df = pd.DataFrame(all_articles)
+        df.to_csv(CSV_FILE, index=False)
+        print(f"Selesai! Berhasil merekap {len(df)} berita.")
 
 if __name__ == "__main__":
-    scrape_unesa()
+    run_scraper()
