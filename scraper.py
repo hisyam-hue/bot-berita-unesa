@@ -1,157 +1,136 @@
-import os
-import re
-import time
-from datetime import datetime
-import pandas as pd
 import requests
 from bs4 import BeautifulSoup
+import pandas as pd
+import re
+import os
 
-# Map bulan Indonesia ke angka
-bulan_map = {
-    "januari": 1, "jan": 1,
-    "februari": 2, "feb": 2,
-    "maret": 3, "mar": 3,
-    "april": 4, "apr": 4,
-    "mei": 5,
-    "juni": 6, "jun": 6,
-    "juli": 7, "jul": 7,
-    "agustus": 8, "agu": 8, "aug": 8,
-    "september": 9, "sep": 9,
-    "oktober": 10, "okt": 10, "oct": 10,
-    "november": 11, "nov": 11,
-    "desember": 12, "des": 12, "dec": 12
+BASE_URL = "https://www.unesa.ac.id/page/berita"
+CSV_FILE = "rekap_berita_unesa.csv"
+MAX_PAGES = 25  # Menyisir hingga 25 halaman agar menyapu seluruh berita September
+
+MONTH_MAP = {
+    'Januari': 1, 'Jan': 1,
+    'Februari': 2, 'Feb': 2,
+    'Maret': 3, 'Mar': 3,
+    'April': 4, 'Apr': 4,
+    'Mei': 5,
+    'Juni': 6, 'Jun': 6,
+    'Juli': 7, 'Jul': 7,
+    'Agustus': 8, 'Agu': 8, 'Ags': 8,
+    'September': 9, 'Sep': 9,
+    'Oktober': 10, 'Okt': 10,
+    'November': 11, 'Nov': 11,
+    'Desember': 12, 'Des': 12
 }
 
-def klasifikasi_tema(judul):
-    txt = judul.lower()
-    if any(k in txt for k in ["juara", "medali", "penghargaan", "gemilang", "peringkat", "prestasi", "borong"]):
-        return "Prestasi Institusi"
-    elif any(k in txt for k in ["mahasiswa", "ormawa", "ukm", "pembinaan", "kegiatan mahasiswa", "tep"]):
-        return "Kemahasiswaan"
-    elif any(k in txt for k in ["delegasi", "kerja sama", "kerjasama", "kunjungan", "mou", "kemitraan", "australia"]):
-        return "Kerjasama"
-    elif any(k in txt for k in ["inovasi", "riset", "penelitian", "pakar", "sastra", "stroke", "buku", "kajian"]):
-        return "Inovasi & Penelitian"
-    elif any(k in txt for k in ["masyarakat", "pengabdian", "desa", "pendampingan", "bakti"]):
-        return "Pengabdian Masyarakat"
-    else:
-        return "Berita Umum"
+def clean_text(text):
+    if not text:
+        return ""
+    return re.sub(r'\s+', ' ', text).strip()
 
-def parse_art_info(art):
-    text = art.get_text(separator=" ")
-    match_date = re.search(r"(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})", text, re.IGNORECASE)
-    tgl_str, bln_num, thn_num = datetime.now().strftime("%d %b %Y"), datetime.now().month, 2026
+def parse_date(date_str):
+    date_str = clean_text(date_str)
+    match = re.search(r'(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})', date_str)
+    if match:
+        day = int(match.group(1))
+        month_name = match.group(2)
+        year = int(match.group(3))
+        month = MONTH_MAP.get(month_name, None)
+        return day, month, year, f"{day} {month_name} {year}"
+    return None, None, None, date_str
 
-    if match_date:
-        day = match_date.group(1)
-        month_name = match_date.group(2).lower()
-        year = int(match_date.group(3))
-        if month_name in bulan_map:
-            bln_num = bulan_map[month_name]
-            thn_num = year
-            tgl_str = f"{day} {match_date.group(2).capitalize()} {year}"
-
-    return tgl_str, bln_num, thn_num
-
-def run_scraper():
-    print("Menjalankan Auto Scraper Unesa di Cloud (Full Scan 2026)...")
-    news_list = []
+def scrape_unesa():
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
-    stop_scraping = False
-    # Pindai hingga 25 halaman agar seluruh berita September 2026 (40+ berita) terekap sempurna
-    for page in range(1, 26):
-        if stop_scraping:
-            break
+    existing_df = pd.DataFrame()
+    existing_links = set()
 
-        url = (
-            "https://unesa.ac.id/category/berita-unesa"
-            if page == 1
-            else f"https://unesa.ac.id/category/berita-unesa/p/{page}/"
-        )
-        print(f"Scraping Halaman {page}: {url}")
+    if os.path.exists(CSV_FILE):
+        try:
+            existing_df = pd.read_csv(CSV_FILE)
+            link_col = [c for c in existing_df.columns if c.lower() == 'link']
+            if link_col:
+                existing_links = set(existing_df[link_col[0]].dropna().astype(str).str.strip())
+        except Exception as e:
+            print(f"Error membaca file lama: {e}")
+
+    new_articles = []
+
+    for page in range(1, MAX_PAGES + 1):
+        url = f"{BASE_URL}?page={page}" if page > 1 else BASE_URL
+        print(f"Scraping halaman {page}: {url}")
 
         try:
-            res = requests.get(url, headers=headers, timeout=10)
+            res = requests.get(url, headers=headers, timeout=15)
             if res.status_code != 200:
-                print(f"Halaman {page} tidak merespons (Status {res.status_code}). Selesai.")
+                print(f"Gagal memuat halaman {page}, status code: {res.status_code}")
                 break
 
-            soup = BeautifulSoup(res.text, "html.parser")
-            articles = soup.find_all("article")
-            if not articles:
-                articles = soup.select(".post, .entry, .item, .card")
+            soup = BeautifulSoup(res.text, 'html.parser')
+            articles = soup.find_all('div', class_=re.compile(r'post|news|berita|card|item', re.I))
 
             if not articles:
-                print(f"Tidak ada artikel ditemukan pada Halaman {page}.")
+                articles = soup.find_all('article')
+
+            if not articles:
+                print(f"Tidak ada artikel ditemukan di halaman {page}")
                 break
 
+            count_page = 0
             for art in articles:
-                title_tag = art.find("h2") or art.find("h3") or art.find("h4")
-                if not title_tag:
+                title_elem = art.find(['h1', 'h2', 'h3', 'h4', 'a'], class_=re.compile(r'title|judul', re.I)) or art.find('a')
+                if not title_elem:
                     continue
 
-                a_tag = title_tag.find("a", href=True) or art.find("a", href=True)
-                if not a_tag:
+                judul = clean_text(title_elem.get_text())
+                link = title_elem.get('href', '') if title_elem.name == 'a' else ''
+                if not link:
+                    a_tag = art.find('a')
+                    if a_tag:
+                        link = a_tag.get('href', '')
+
+                if link and not link.startswith('http'):
+                    link = 'https://www.unesa.ac.id' + link
+
+                if not judul or len(judul) < 5 or link in existing_links:
                     continue
 
-                title = a_tag.text.strip()
-                link = a_tag["href"]
+                date_elem = art.find(class_=re.compile(r'date|tgl|time|meta', re.I)) or art.find('time')
+                date_text = date_elem.get_text() if date_elem else ""
+                day, month, year, formatted_date = parse_date(date_text)
 
-                if (
-                    len(title) > 12
-                    and not link.startswith("#")
-                    and "category" not in link
-                ):
-                    full_link = (
-                        link
-                        if link.startswith("http")
-                        else f"https://unesa.ac.id{link}"
-                    )
-                    tgl, bln, thn = parse_art_info(art)
+                cat_elem = art.find(class_=re.compile(r'cat|kategori|badge|tag', re.I))
+                kategori = clean_text(cat_elem.get_text()) if cat_elem else "Berita Umum"
 
-                    # Hentikan jika mendeteksi berita tahun 2025 atau sebelumnya
-                    if thn < 2026:
-                        stop_scraping = True
-                        break
+                new_articles.append({
+                    'tanggal': formatted_date,
+                    'judul': judul,
+                    'kategori': kategori,
+                    'link': link,
+                    'bulan': month,
+                    'tahun': year
+                })
+                existing_links.add(link)
+                count_page += 1
 
-                    kategori_tema = klasifikasi_tema(title)
-
-                    news_list.append(
-                        {
-                            "tanggal": tgl,
-                            "judul": title,
-                            "kategori": kategori_tema,
-                            "link": full_link,
-                            "bulan": bln,
-                            "tahun": thn,
-                        }
-                    )
-            time.sleep(0.3)
+            print(f"Halaman {page}: didapat {count_page} berita baru.")
         except Exception as e:
-            print(f"Error halaman {page}: {e}")
+            print(f"Error pada halaman {page}: {e}")
             break
 
-    if news_list:
-        df_new = pd.DataFrame(news_list).drop_duplicates(subset=["link"])
-        file_name = "rekap_berita_unesa.csv"
-
-        if os.path.exists(file_name):
-            df_old = pd.read_csv(file_name)
-            df_combined = (
-                pd.concat([df_new, df_old])
-                .drop_duplicates(subset=["link"], keep="first")
-                .reset_index(drop=True)
-            )
-            df_combined.to_csv(file_name, index=False)
-            print(f"BERHASIL! Total {len(df_combined)} berita tersimpan di {file_name}")
+    if new_articles:
+        new_df = pd.DataFrame(new_articles)
+        if not existing_df.empty:
+            final_df = pd.concat([new_df, existing_df], ignore_index=True)
         else:
-            df_new.to_csv(file_name, index=False)
-            print(f"BERHASIL! Total {len(df_new)} berita tersimpan di {file_name}")
+            final_df = new_df
+
+        final_df.to_csv(CSV_FILE, index=False)
+        print(f"Berhasil menambahkan {len(new_articles)} berita baru ke {CSV_FILE}.")
     else:
-        print("Tidak ada berita baru yang ditarik.")
+        print("Tidak ada berita baru yang ditemukan.")
 
 if __name__ == "__main__":
-    run_scraper()
+    scrape_unesa()
