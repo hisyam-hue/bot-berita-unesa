@@ -2,11 +2,10 @@ import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 import re
-import os
 
 BASE_URL = "https://www.unesa.ac.id/page/berita"
 CSV_FILE = "rekap_berita_unesa.csv"
-MAX_PAGES = 30
+MAX_PAGES = 25  # Menyapu penuh 25 halaman berita
 
 MONTH_MAP = {
     'Januari': 1, 'Jan': 1, 'Februari': 2, 'Feb': 2, 'Maret': 3, 'Mar': 3,
@@ -33,22 +32,11 @@ def parse_date(date_str):
 
 def scrape_unesa():
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
-    existing_df = pd.DataFrame()
-    existing_links = set()
-
-    if os.path.exists(CSV_FILE):
-        try:
-            existing_df = pd.read_csv(CSV_FILE)
-            link_col = [c for c in existing_df.columns if c.lower() == 'link']
-            if link_col:
-                existing_links = set(existing_df[link_col[0]].dropna().astype(str).str.strip())
-        except Exception as e:
-            print(f"Error membaca file lama: {e}")
-
-    new_articles = []
+    all_articles = []
+    seen_links = set()
 
     for page in range(1, MAX_PAGES + 1):
         url = f"{BASE_URL}?page={page}" if page > 1 else BASE_URL
@@ -57,13 +45,15 @@ def scrape_unesa():
         try:
             res = requests.get(url, headers=headers, timeout=15)
             if res.status_code != 200:
+                print(f"Gagal memuat halaman {page}")
                 break
 
             soup = BeautifulSoup(res.text, 'html.parser')
-            article_blocks = soup.find_all(['div', 'article'], class_=re.compile(r'post|news|berita|card|item|col', re.I))
+            
+            # Cari elemen artikel berita
+            articles = soup.find_all(['div', 'article'], class_=re.compile(r'post|news|berita|card|item|col', re.I))
 
-            count_page = 0
-            for art in article_blocks:
+            for art in articles:
                 a_tag = art.find('a', href=re.compile(r'/read/'))
                 if not a_tag:
                     continue
@@ -72,7 +62,7 @@ def scrape_unesa():
                 if not link.startswith('http'):
                     link = 'https://www.unesa.ac.id' + link
 
-                if link in existing_links:
+                if link in seen_links:
                     continue
 
                 h_tag = art.find(['h1', 'h2', 'h3', 'h4', 'h5'])
@@ -91,7 +81,7 @@ def scrape_unesa():
 
                 day, month, year, formatted_date = parse_date(date_text)
 
-                new_articles.append({
+                all_articles.append({
                     'tanggal': formatted_date,
                     'judul': judul,
                     'kategori': kategori,
@@ -99,19 +89,18 @@ def scrape_unesa():
                     'bulan': month,
                     'tahun': year
                 })
-                existing_links.add(link)
-                count_page += 1
+                seen_links.add(link)
 
-            print(f"Halaman {page}: didapat {count_page} berita.")
         except Exception as e:
             print(f"Error halaman {page}: {e}")
             break
 
-    if new_articles:
-        new_df = pd.DataFrame(new_articles)
-        final_df = pd.concat([new_df, existing_df], ignore_index=True) if not existing_df.empty else new_df
+    if all_articles:
+        final_df = pd.DataFrame(all_articles)
         final_df.to_csv(CSV_FILE, index=False)
-        print(f"Berhasil menambahkan {len(new_articles)} berita baru.")
+        print(f"Berhasil! Rekap total {len(final_df)} berita disimpan ke {CSV_FILE}.")
+    else:
+        print("Tidak ada artikel yang diambil.")
 
 if __name__ == "__main__":
     scrape_unesa()
