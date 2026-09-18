@@ -1,10 +1,11 @@
 import pandas as pd
 import re
 import time
+from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
 CSV_FILE = "rekap_berita_unesa.csv"
-MAX_PAGES = 5  # Mengambil 5 halaman (sekitar 50 berita September)
+MAX_PAGES = 5  # Menyapu 5 halaman (sekitar 50 berita September)
 
 MONTH_MAP = {
     'Januari': 1, 'Jan': 1, 'Februari': 2, 'Feb': 2, 'Maret': 3, 'Mar': 3,
@@ -34,21 +35,25 @@ def run_scraper():
     seen_links = set()
 
     with sync_playwright() as p:
+        # Launch browser chromium headless
         browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        print("Membuka halaman berita Unesa...")
-        page.goto("https://www.unesa.ac.id/page/berita", timeout=60000)
+        context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        page = context.new_page()
+
+        print("Membuka halaman berita UNESA...")
+        try:
+            page.goto("https://www.unesa.ac.id/page/berita", wait_until="domcontentloaded", timeout=60000)
+        except Exception as e:
+            print(f"Gagal membuka halaman awal: {e}")
 
         for p_num in range(1, MAX_PAGES + 1):
-            print(f"Mengambil data halaman {p_num}...")
-            time.sleep(3)  # Tunggu AJAX render
+            print(f"=== Mengambil data halaman {p_num} ===")
+            page.wait_for_timeout(3000)  # Tunggu render AJAX
 
-            # Ambil HTML konten
             html = page.content()
-            from bs4 import BeautifulSoup
             soup = BeautifulSoup(html, 'html.parser')
-            
             a_tags = soup.find_all('a', href=re.compile(r'/read/'))
+
             count = 0
             for a in a_tags:
                 link = a.get('href', '')
@@ -61,7 +66,7 @@ def run_scraper():
                 judul = clean_text(a.get_text())
                 parent = a.find_parent(['div', 'article', 'li'])
 
-                if len(judul) < 15 or "Read More" in judul:
+                if len(judul) < 15 or "Read More" in judul or "Selengkapnya" in judul:
                     if parent:
                         h_tag = parent.find(['h1', 'h2', 'h3', 'h4', 'h5'])
                         if h_tag:
@@ -78,6 +83,10 @@ def run_scraper():
                     if dm:
                         date_text = dm.group(0)
 
+                    cat_elem = parent.find(class_=re.compile(r'cat|kategori|badge|tag', re.I))
+                    if cat_elem:
+                        kategori = clean_text(cat_elem.get_text())
+
                 day, month, year, formatted_date = parse_date(date_text)
 
                 all_articles.append({
@@ -91,18 +100,31 @@ def run_scraper():
                 seen_links.add(link)
                 count += 1
 
-            print(f"Halaman {p_num}: didapat {count} berita.")
+            print(f"Halaman {p_num}: didapat {count} berita baru.")
 
-            # Klik tombol Next/Halaman berikutnya
+            # Berpindah ke halaman berikutnya
             if p_num < MAX_PAGES:
-                try:
-                    next_button = page.locator(f"a:has-text('{p_num + 1}')").first
-                    if next_button.is_visible():
-                        next_button.click()
-                    else:
-                        break
-                except Exception as e:
-                    print(f"Gagal pindah ke halaman {p_num + 1}: {e}")
+                clicked = False
+                # Coba beberapa variasi penulisan tombol pagination
+                targets = [
+                    f"text='{p_num + 1}'",
+                    f"a:has-text('{p_num + 1}')",
+                    ".pagination li a:has-text('Next')",
+                    ".page-link:has-text('»')"
+                ]
+                for target in targets:
+                    try:
+                        elem = page.locator(target).first
+                        if elem.is_visible():
+                            elem.click()
+                            clicked = True
+                            print(f"Berhasil mengklik halaman {p_num + 1} menggunakan target: {target}")
+                            break
+                    except Exception:
+                        continue
+
+                if not clicked:
+                    print(f"Tidak dapat menemukan tombol navigasi ke halaman {p_num + 1}. Menghentikan perulangan.")
                     break
 
         browser.close()
@@ -110,7 +132,9 @@ def run_scraper():
     if all_articles:
         df = pd.DataFrame(all_articles)
         df.to_csv(CSV_FILE, index=False)
-        print(f"Selesai! Berhasil merekap {len(df)} berita.")
+        print(f"Selesai! Total {len(df)} artikel berhasil disave ke {CSV_FILE}.")
+    else:
+        print("Tidak ada artikel yang berhasil diekstrak.")
 
 if __name__ == "__main__":
     run_scraper()
